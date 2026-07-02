@@ -1,60 +1,87 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-import httpx
 
 from app.core.database import get_db
 from app.core.security import verify_token
 from app.models.law import LawChunk
-from app.services.openai_service import generate_embedding, chat_completion
+from app.services.rag_service import search_law_chunks
 
 router = APIRouter(prefix="/laws", tags=["laws"])
 
 
-@router.get("/search")
-async def search_laws(
-    query: str,
+@router.get("")
+async def list_acts(
     token_data: dict = Depends(verify_token),
     db: AsyncSession = Depends(get_db),
-) -> dict:
-    query_embedding = await generate_embedding(query)
+) -> list[dict]:
     stmt = (
-        select(LawChunk)
-        .order_by(LawChunk.embedding.cosine_distance(query_embedding))
-        .limit(5)
+        select(
+            LawChunk.act_name,
+            LawChunk.act_short,
+            func.count().label("chunk_count"),
+        )
+        .group_by(LawChunk.act_name, LawChunk.act_short)
+        .order_by(LawChunk.act_name)
     )
     result = await db.execute(stmt)
-    relevant_chunks = list(result.scalars().all())
-
-    context = "\n\n".join(
-        f"[{c.act_short} - {c.section}] {c.chunk_text}" for c in relevant_chunks
-    )
-
-    system_prompt = (
-        "You are a legal research assistant. Based on the provided Indian law context, "
-        "answer the user's question. Cite the specific act and section when possible.\n\n"
-        f"Context:\n{context}"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query},
+    return [
+        {"act_name": row.act_name, "act_short": row.act_short, "chunk_count": row.chunk_count}
+        for row in result.all()
     ]
-    answer = await chat_completion(messages)
-    return {"answer": answer, "sources": len(relevant_chunks)}
 
 
-@router.get("/external/{jurisdiction}")
-async def external_law_lookup(
-    jurisdiction: str,
-    query: str,
+@router.get("/search")
+async def search_laws(
+    q: str = Query(..., description="Search query"),
     token_data: dict = Depends(verify_token),
-) -> dict:
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"https://api.example.com/laws/{jurisdiction}",
-            params={"q": query},
-            timeout=30.0,
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    if not q.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Query parameter 'q' is required",
         )
-        response.raise_for_status()
-        return response.json()
+
+    chunks = await search_law_chunks(q, db, top_k=10)
+    return [
+        {
+            "act_name": c["act_name"],
+            "section": c["section"],
+            "chunk_text": c["chunk_text"],
+            "similarity": c["similarity_score"],
+        }
+        for c in chunks
+    ]
+
+
+@router.get("/{act_short}")
+async def get_act_sections(
+    act_short: str,
+    token_data: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    stmt = (
+        select(LawChunk)
+        .where(LawChunk.act_short == act_short.upper())
+        .distinct(LawChunk.section)
+        .order_by(LawChunk.section, LawChunk.chunk_index)
+    )
+    result = await db.execute(stmt)
+    chunks = result.scalars().all()
+
+    if not chunks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Act '{act_short}' not found",
+        )
+
+    return [
+        {
+            "act_name": c.act_name,
+            "act_short": c.act_short,
+            "section": c.section,
+            "chunk_text": c.chunk_text[:500] + ("..." if len(c.chunk_text) > 500 else ""),
+        }
+        for c in chunks
+    ]

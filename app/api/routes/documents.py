@@ -1,98 +1,149 @@
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
+import os
+import uuid
+
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
-from app.core.security import verify_token
+from app.core.database import get_db, async_session_factory
+from app.core.security import get_current_user
 from app.models.document import Document, DocumentChunk
 from app.models.user import User
-from app.services.document_parser import extract_text_from_pdf, chunk_text
+from app.services.document_parser import extract_text_from_pdf, extract_text_from_image, chunk_text
 from app.services.openai_service import generate_embedding
+from app.services.rag_service import analyze_document
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "tiff", "bmp"}
+CONTENT_TYPE_MAP = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "tiff": "image/tiff",
+    "bmp": "image/bmp",
+}
+
+
+def _get_ext(filename: str) -> str | None:
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    return ext if ext in ALLOWED_EXTENSIONS else None
+
+
+async def _background_chunk_and_embed(document_id: uuid.UUID, raw_text: str) -> None:
+    async with async_session_factory() as db:
+        raw_chunks = chunk_text(raw_text)
+        for i, chunk_text_content in enumerate(raw_chunks):
+            embedding = await generate_embedding(chunk_text_content)
+            chunk = DocumentChunk(
+                document_id=document_id,
+                chunk_index=i,
+                chunk_text=chunk_text_content,
+                embedding=embedding,
+            )
+            db.add(chunk)
+
+        doc_result = await db.execute(select(Document).where(Document.id == document_id))
+        doc = doc_result.scalar_one_or_none()
+        if doc:
+            doc.summary = doc.summary
+        await db.commit()
 
 
 @router.post("/upload")
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     title: str = Form(...),
-    file_type: str = Form("pdf"),
     document_type: str | None = Form(None),
     jurisdiction: str = Form("india"),
-    token_data: dict = Depends(verify_token),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
+    if not file.filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No filename provided")
+
+    ext = _get_ext(file.filename)
+    if ext is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF files are supported",
+            detail=f"Unsupported file type. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
     file_bytes = await file.read()
-    raw_text = extract_text_from_pdf(file_bytes)
+    if not file_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file")
 
-    result = await db.execute(
-        select(User).where(User.firebase_uid == token_data["uid"])
-    )
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    # ── Extract text ─────────────────────────────────────────────────
+    if ext == "pdf":
+        raw_text = await extract_text_from_pdf(file_bytes)
+    else:
+        raw_text = await extract_text_from_image(file_bytes)
 
-    document = Document(
-        user_id=user.id,
-        title=title,
-        file_url="",  # caller should update with Firebase Storage URL after upload
-        file_type=file_type,
-        raw_text=raw_text,
-        document_type=document_type,
-        jurisdiction=jurisdiction,
-    )
-    db.add(document)
-    await db.commit()
-    await db.refresh(document)
-
-    raw_chunks = chunk_text(raw_text)
-    for i, chunk_text_content in enumerate(raw_chunks):
-        embedding = await generate_embedding(chunk_text_content)
-        chunk = DocumentChunk(
-            document_id=document.id,
-            chunk_index=i,
-            chunk_text=chunk_text_content,
-            embedding=embedding,
+    if not raw_text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No text could be extracted from the file",
         )
-        db.add(chunk)
+
+    # ── Upload to Firebase Storage ────────────────────────────────────
+    from app.core.security import get_storage_bucket
+    bucket = get_storage_bucket()
+    file_uuid = str(uuid.uuid4())
+    blob_path = f"users/{current_user.id}/documents/{file_uuid}.{ext}"
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(file_bytes, content_type=CONTENT_TYPE_MAP.get(ext, "application/octet-stream"))
+    blob.make_public()
+    file_url = blob.public_url
+
+    # ── Analyze document ──────────────────────────────────────────────
+    analysis = await analyze_document(raw_text, document_type=document_type)
+
+    doc = Document(
+        user_id=current_user.id,
+        title=title,
+        file_url=file_url,
+        file_type=ext,
+        raw_text=raw_text,
+        summary=analysis.get("summary", ""),
+        document_type=analysis.get("document_type", document_type),
+        jurisdiction=jurisdiction,
+        key_clauses=analysis.get("key_clauses", []),
+        risk_flags=analysis.get("risk_flags", []),
+    )
+    db.add(doc)
     await db.commit()
+    await db.refresh(doc)
+
+    # ── Background: chunk + embed ─────────────────────────────────────
+    background_tasks.add_task(_background_chunk_and_embed, doc.id, raw_text)
 
     return {
-        "document_id": str(document.id),
-        "title": document.title,
-        "chunks": len(raw_chunks),
+        "document_id": str(doc.id),
+        "title": doc.title,
+        "summary": doc.summary,
+        "document_type": doc.document_type,
+        "risk_flags": doc.risk_flags or [],
     }
 
 
 @router.get("/")
 async def list_documents(
-    token_data: dict = Depends(verify_token),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
     result = await db.execute(
-        select(User).where(User.firebase_uid == token_data["uid"])
+        select(Document)
+        .where(Document.user_id == current_user.id, Document.deleted_at.is_(None))
+        .order_by(Document.created_at.desc())
     )
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    docs_result = await db.execute(
-        select(Document).where(Document.user_id == user.id).order_by(Document.created_at.desc())
-    )
-    documents = docs_result.scalars().all()
+    documents = result.scalars().all()
     return [
         {
             "id": str(doc.id),
             "title": doc.title,
-            "file_type": doc.file_type,
             "document_type": doc.document_type,
-            "jurisdiction": doc.jurisdiction,
             "summary": doc.summary,
             "created_at": doc.created_at.isoformat(),
         }
@@ -103,11 +154,15 @@ async def list_documents(
 @router.get("/{document_id}")
 async def get_document(
     document_id: str,
-    token_data: dict = Depends(verify_token),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     result = await db.execute(
-        select(Document).where(Document.id == document_id)
+        select(Document).where(
+            Document.id == document_id,
+            Document.user_id == current_user.id,
+            Document.deleted_at.is_(None),
+        )
     )
     doc = result.scalar_one_or_none()
     if doc is None:
@@ -121,6 +176,8 @@ async def get_document(
         "document_type": doc.document_type,
         "jurisdiction": doc.jurisdiction,
         "summary": doc.summary,
+        "key_clauses": doc.key_clauses or [],
+        "risk_flags": doc.risk_flags or [],
         "created_at": doc.created_at.isoformat(),
     }
 
@@ -128,16 +185,22 @@ async def get_document(
 @router.delete("/{document_id}")
 async def delete_document(
     document_id: str,
-    token_data: dict = Depends(verify_token),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    from datetime import datetime, timezone
+
     result = await db.execute(
-        select(Document).where(Document.id == document_id)
+        select(Document).where(
+            Document.id == document_id,
+            Document.user_id == current_user.id,
+            Document.deleted_at.is_(None),
+        )
     )
-    document = result.scalar_one_or_none()
-    if document is None:
+    doc = result.scalar_one_or_none()
+    if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    await db.delete(document)
+    doc.deleted_at = datetime.now(timezone.utc)
     await db.commit()
     return {"detail": "Document deleted"}

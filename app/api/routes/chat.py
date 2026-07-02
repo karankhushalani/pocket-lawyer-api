@@ -3,108 +3,145 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import verify_token
+from app.core.security import get_current_user
 from app.models.chat import ChatMessage
-from app.models.user import User
 from app.models.document import Document
+from app.models.user import User
 from app.services.openai_service import chat_completion
-from app.services.rag_service import retrieve_relevant_chunks
+from app.services.rag_service import build_legal_context
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-@router.post("/messages")
+LEX_SYSTEM_PROMPT = (
+    "You are Lex, an AI legal assistant specializing in Indian law. You help users "
+    "understand legal documents and Indian statutes.\n\n"
+    "Rules:\n"
+    "- Always cite specific sections when referencing statutes "
+    "(e.g., 'Under Section 302 of IPC...')\n"
+    "- Always add a disclaimer: 'This is general legal information, not legal advice. "
+    "Consult a qualified lawyer for your specific situation.'\n"
+    "- If you don't know something, say so \u2014 never fabricate legal references\n"
+    "- Keep responses clear and accessible, avoiding unnecessary jargon\n"
+    "- Focus on Indian jurisdiction unless asked otherwise"
+)
+
+
+@router.post("")
 async def send_message(
     body: dict,
-    token_data: dict = Depends(verify_token),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    user_result = await db.execute(
-        select(User).where(User.firebase_uid == token_data["uid"])
-    )
-    user = user_result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
     user_message = body.get("message", "")
-    document_id = body.get("document_id", None)
+    document_id = body.get("document_id")
+    conversation_id = body.get("conversation_id") or "default"
 
     if not user_message:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message is required")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Message is required",
+        )
 
     if document_id:
         doc_result = await db.execute(
-            select(Document).where(Document.id == document_id, Document.user_id == user.id)
+            select(Document).where(
+                Document.id == document_id, Document.user_id == user.id
+            )
         )
-        doc = doc_result.scalar_one_or_none()
-        if doc is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        if doc_result.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found",
+            )
 
-    msg = ChatMessage(
+    ctx = await build_legal_context(user_message, db, document_id=document_id)
+
+    context_parts = [ctx["law_context"], ctx["document_context"]]
+    context = "\n\n".join(p for p in context_parts if p)
+
+    history_result = await db.execute(
+        select(ChatMessage)
+        .where(
+            ChatMessage.user_id == user.id,
+            ChatMessage.conversation_id == conversation_id,
+        )
+        .order_by(ChatMessage.created_at.desc())
+        .limit(6)
+    )
+    history = list(reversed(history_result.scalars().all()))
+
+    openai_messages = [{"role": "system", "content": LEX_SYSTEM_PROMPT}]
+    for h in history:
+        openai_messages.append({"role": h.role, "content": h.content})
+
+    user_msg_content = user_message
+    if context:
+        user_msg_content = f"Context:\n{context}\n\nUser question:\n{user_message}"
+    openai_messages.append({"role": "user", "content": user_msg_content})
+
+    reply = await chat_completion(openai_messages)
+
+    user_msg = ChatMessage(
+        conversation_id=conversation_id,
         document_id=document_id,
         user_id=user.id,
         role="user",
         content=user_message,
     )
-    db.add(msg)
-    await db.commit()
-
-    relevant_chunks = await retrieve_relevant_chunks(user_message, db)
-
-    context = "\n\n".join([chunk.chunk_text for chunk in relevant_chunks])
-    system_prompt = (
-        "You are a helpful legal assistant. Use the following context to answer the user's question. "
-        "If the context does not contain relevant information, say so.\n\n"
-        f"Context:\n{context}"
-    )
-
-    history_result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.user_id == user.id)
-        .order_by(ChatMessage.created_at.asc())
-    )
-    history = history_result.scalars().all()
-
-    openai_messages = [{"role": "system", "content": system_prompt}]
-    for h in history:
-        openai_messages.append({"role": h.role, "content": h.content})
-
-    reply = await chat_completion(openai_messages)
-
     assistant_msg = ChatMessage(
+        conversation_id=conversation_id,
         document_id=document_id,
         user_id=user.id,
         role="assistant",
         content=reply,
     )
+    db.add(user_msg)
     db.add(assistant_msg)
     await db.commit()
 
-    return {"reply": reply}
+    sources = []
+    for s in ctx["sources"]:
+        if s["type"] == "law":
+            sources.append({"act_name": s["act_name"], "section": s["section"]})
+
+    return {
+        "response": reply,
+        "sources": sources,
+        "message_id": str(assistant_msg.id),
+    }
 
 
-@router.get("/messages")
-async def list_messages(
-    token_data: dict = Depends(verify_token),
+@router.get("/history/{document_id}")
+async def get_document_history(
+    document_id: str,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
-    user_result = await db.execute(
-        select(User).where(User.firebase_uid == token_data["uid"])
+    doc_result = await db.execute(
+        select(Document).where(
+            Document.id == document_id, Document.user_id == user.id
+        )
     )
-    user = user_result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if doc_result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
 
     messages_result = await db.execute(
         select(ChatMessage)
-        .where(ChatMessage.user_id == user.id)
+        .where(
+            ChatMessage.user_id == user.id,
+            ChatMessage.document_id == document_id,
+        )
         .order_by(ChatMessage.created_at.asc())
     )
     messages = messages_result.scalars().all()
     return [
         {
             "id": str(m.id),
-            "document_id": str(m.document_id) if m.document_id else None,
+            "conversation_id": m.conversation_id,
             "role": m.role,
             "content": m.content,
             "created_at": m.created_at.isoformat(),
