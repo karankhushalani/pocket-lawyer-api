@@ -44,10 +44,6 @@ async def _background_chunk_and_embed(document_id: uuid.UUID, raw_text: str) -> 
             )
             db.add(chunk)
 
-        doc_result = await db.execute(select(Document).where(Document.id == document_id))
-        doc = doc_result.scalar_one_or_none()
-        if doc:
-            doc.summary = doc.summary
         await db.commit()
 
 
@@ -55,7 +51,7 @@ async def _background_chunk_and_embed(document_id: uuid.UUID, raw_text: str) -> 
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    title: str = Form(...),
+    title: str | None = Form(None),
     document_type: str | None = Form(None),
     jurisdiction: str = Form("india"),
     current_user: User = Depends(get_current_user),
@@ -90,19 +86,22 @@ async def upload_document(
     # ── Upload to Firebase Storage ────────────────────────────────────
     from app.core.security import get_storage_bucket
     bucket = get_storage_bucket()
-    file_uuid = str(uuid.uuid4())
-    blob_path = f"users/{current_user.id}/documents/{file_uuid}.{ext}"
-    blob = bucket.blob(blob_path)
-    blob.upload_from_string(file_bytes, content_type=CONTENT_TYPE_MAP.get(ext, "application/octet-stream"))
-    blob.make_public()
-    file_url = blob.public_url
+    if bucket is None:
+        file_url = f"dev://placeholder/{file.filename}"
+    else:
+        file_uuid = str(uuid.uuid4())
+        blob_path = f"users/{current_user.id}/documents/{file_uuid}.{ext}"
+        blob = bucket.blob(blob_path)
+        blob.upload_from_string(file_bytes, content_type=CONTENT_TYPE_MAP.get(ext, "application/octet-stream"))
+        blob.make_public()
+        file_url = blob.public_url
 
     # ── Analyze document ──────────────────────────────────────────────
     analysis = await analyze_document(raw_text, document_type=document_type)
 
     doc = Document(
         user_id=current_user.id,
-        title=title,
+        title=title or file.filename or "Untitled",
         file_url=file_url,
         file_type=ext,
         raw_text=raw_text,

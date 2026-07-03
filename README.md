@@ -1,6 +1,6 @@
 # Pocket Lawyer API
 
-FastAPI backend for the Pocket Lawyer app — a RAG-powered legal research and document analysis platform. Provides vector search over Indian bare acts and user-uploaded documents using OpenAI embeddings + GPT-4o-mini, with Firebase Authentication.
+FastAPI backend for the Pocket Lawyer app — a RAG-powered legal research and document analysis platform. Provides vector search over Indian bare acts and user-uploaded documents using OpenAI embeddings + GPT-4o, with Firebase Authentication.
 
 ## Architecture
 
@@ -20,9 +20,9 @@ FastAPI backend for the Pocket Lawyer app — a RAG-powered legal research and d
 
 ## Features
 
-- **22 Indian Bare Acts** — Pre-ingested with text-embedding-3-small vectors for semantic search
+- **40+ Indian Bare Acts** — Pre-ingested with text-embedding-3-small vectors for semantic search
 - **Document Upload** — PDF/image upload, text extraction via pdfplumber, chunking, embedding, and RAG storage
-- **AI Legal Q&A** — Chat with GPT-4o-mini grounded in retrieved document or law chunks
+- **AI Legal Q&A** — Chat with GPT-4o grounded in retrieved document or law chunks
 - **Firebase Auth** — Token-based authentication with email/password and Google Sign-In
 - **Background Processing** — Document analysis (extract → chunk → embed) runs asynchronously on upload
 
@@ -36,7 +36,7 @@ FastAPI backend for the Pocket Lawyer app — a RAG-powered legal research and d
 | ORM | SQLAlchemy 2.0 (async) |
 | Migrations | Alembic 1.14 |
 | Embeddings | OpenAI text-embedding-3-small |
-| LLM | OpenAI GPT-4o-mini |
+| LLM | OpenAI GPT-4o |
 | Auth | Firebase Admin SDK |
 | PDF Parsing | pdfplumber 0.11 |
 | File Storage | Firebase Storage / local |
@@ -111,7 +111,7 @@ python -m scripts.ingest_laws --act ipc
 python -m scripts.ingest_laws --act "indian contract act"
 ```
 
-PDFs live in `data/laws/`. See [LAWS_INVENTORY.md](data/laws/LAWS_INVENTORY.md) for the full list and download status.
+PDFs live in `data/laws/` (gitignored). See [LAWS_INVENTORY.md](data/laws/LAWS_INVENTORY.md) for the full list.
 
 ## API Endpoints
 
@@ -152,14 +152,15 @@ pocket-lawyer-api/
 │   │   ├── chat.py             # /chat/, /chat/history/{document_id}
 │   │   └── laws.py             # /laws/, /laws/search, /laws/{act_short}
 │   └── services/
-│       ├── document_parser.py   # PDF/image text extraction, chunking, embedding
+│       ├── openai_service.py    # OpenAI embeddings & chat completion wrapper
+│       ├── document_parser.py   # PDF/image text extraction & chunking
 │       └── rag_service.py       # Vector search, context building, document analysis
 ├── scripts/
 │   ├── ingest_laws.py          # Law PDF ingestion pipeline
 │   ├── _download_pdfs.py       # PDF downloader from India Code
 │   ├── _find_handles.py        # Handle discovery tool
 │   └── ...
-├── data/laws/                  # Bare act PDFs (22 files, gitignored)
+├── data/laws/                  # Bare act PDFs (gitignored)
 ├── alembic/                    # Migrations (0001-0003)
 └── requirements.txt
 ```

@@ -32,7 +32,9 @@ def get_firebase_app():
 def get_storage_bucket():
     global _firebase_bucket
     if _firebase_bucket is None:
-        get_firebase_app()
+        app = get_firebase_app()
+        if app is None:
+            return None
         _firebase_bucket = storage.bucket()
     return _firebase_bucket
 

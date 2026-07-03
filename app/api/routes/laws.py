@@ -61,11 +61,25 @@ async def get_act_sections(
     token_data: dict = Depends(verify_token),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
+    first_chunk_per_section = (
+        select(
+            LawChunk.section,
+            func.min(LawChunk.chunk_index).label("min_index"),
+        )
+        .where(LawChunk.act_short == act_short.upper())
+        .group_by(LawChunk.section)
+        .subquery()
+    )
+
     stmt = (
         select(LawChunk)
+        .join(
+            first_chunk_per_section,
+            (LawChunk.section == first_chunk_per_section.c.section)
+            & (LawChunk.chunk_index == first_chunk_per_section.c.min_index),
+        )
         .where(LawChunk.act_short == act_short.upper())
-        .distinct(LawChunk.section)
-        .order_by(LawChunk.section, LawChunk.chunk_index)
+        .order_by(LawChunk.section)
     )
     result = await db.execute(stmt)
     chunks = result.scalars().all()

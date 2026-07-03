@@ -20,10 +20,12 @@ async def search_law_chunks(
     stmt = select(
         LawChunk,
         (1 - distance).label("similarity_score"),
-    ).order_by(distance).limit(top_k)
+    ).order_by(distance)
 
     if act_filter:
         stmt = stmt.where(LawChunk.act_short == act_filter.upper())
+
+    stmt = stmt.limit(top_k)
 
     result = await db.execute(stmt)
     return [
@@ -76,7 +78,11 @@ async def build_legal_context(
     if document_id:
         doc_task = search_document_chunks(user_query, document_id, db)
 
-    results = await asyncio.gather(law_task, doc_task) if doc_task else await asyncio.gather(law_task)
+    tasks = [law_task]
+    if doc_task:
+        tasks.append(doc_task)
+
+    results = await asyncio.gather(*tasks)
 
     law_results: list[dict] = results[0]
     doc_results: list[dict] = results[1] if doc_task else []

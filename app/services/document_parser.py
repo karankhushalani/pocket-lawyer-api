@@ -114,18 +114,3 @@ def _overlap_tail(text: str, overlap: int) -> str:
     return ' '.join(words[-overlap:])
 
 
-async def embed_chunks(
-    chunks: list[str], openai_client: AsyncOpenAI | None = None
-) -> list[list[float]]:
-    c = openai_client or client
-    batch_size = 100
-    embeddings: list[list[float]] = []
-
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i : i + batch_size]
-        response = await c.embeddings.create(
-            input=batch, model='text-embedding-3-small'
-        )
-        embeddings.extend([item.embedding for item in response.data])
-
-    return embeddings

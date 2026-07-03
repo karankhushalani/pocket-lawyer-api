@@ -80,7 +80,7 @@ async def send_message(
         user_msg_content = f"Context:\n{context}\n\nUser question:\n{user_message}"
     openai_messages.append({"role": "user", "content": user_msg_content})
 
-    reply = await chat_completion(openai_messages)
+    reply = await chat_completion(openai_messages, model="gpt-4o", max_tokens=4096)
 
     user_msg = ChatMessage(
         conversation_id=conversation_id,
